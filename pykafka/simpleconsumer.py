@@ -322,6 +322,9 @@ class SimpleConsumer():
             else:
                 timeout = 1.0
 
+        if not self._running:
+            raise ConsumerStoppedException()
+
         while True:
             if self._messages_arrived.acquire(blocking=block, timeout=timeout):
                 # by passing through this semaphore, we know that at

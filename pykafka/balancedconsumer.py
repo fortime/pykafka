@@ -28,6 +28,7 @@ from uuid import uuid4
 from kazoo.client import KazooClient
 from kazoo.exceptions import (NoNodeException, NodeExistsError, ConnectionLoss,
                               ConnectionClosedError)
+from kazoo.protocol.states import KazooState
 from kazoo.recipe.watchers import ChildrenWatch
 
 from .common import OffsetType
@@ -182,6 +183,7 @@ class BalancedConsumer():
 
         self._zookeeper = None
         self._owns_zookeeper = zookeeper is None
+        self._zookeeper_connected = False
         if zookeeper is not None:
             self._zookeeper = zookeeper
         if auto_start is True:
@@ -398,6 +400,10 @@ class BalancedConsumer():
             self._zookeeper, self._consumer_id_path,
             self._consumers_changed
         )
+
+        self._zookeeper.add_listener(self._zookeeper_state_changed)
+        self._zookeeper_connected = self._zookeeper.state == KazooState.CONNECTED
+
         self._setting_watches = False
 
     def _add_self(self):
@@ -437,6 +443,21 @@ class BalancedConsumer():
                     # If retrying, be sure to make sure the
                     # partition allocation is correct.
                     participants = self._get_participants()
+                    if self._consumer_id not in participants:
+                        self._consumer.stop()
+                        # zookeeper failure, all ephemeral nodes for this consumer should be
+                        # missing.
+                        self._partitions -= self._partitions
+                        # If the zookeeper connection dies, the consumer's ID is removed from
+                        # zookeeper's registry. When the zookeeper connection is regained, the
+                        # consumer needs to actively add itself to that registry. Since we can't
+                        # count on the zookeeper connection failing in a particular piece of
+                        # code, this seems like the best place to handle it: if we have an
+                        # active ZK connection, this function will be called by its watch and
+                        # _add_self will happen.
+                        self._add_self()
+                        continue
+
                     partitions = self._decide_partitions(participants)
 
                     old_partitions = self._partitions - partitions
@@ -537,14 +558,6 @@ class BalancedConsumer():
         if self._setting_watches:
             return
         log.debug("Rebalance triggered by consumer change")
-        # If the zookeeper connection dies, the consumer's ID is removed from
-        # zookeeper's registry. When the zookeeper connection is regained, the
-        # consumer needs to actively add itself to that registry. Since we can't
-        # count on the zookeeper connection failing in a particular piece of
-        # code, this seems like the best place to handle it: if we have an
-        # active ZK connection, this function will be called by its watch and
-        # _add_self will happen.
-        self._add_self()
         self._rebalance()
 
     def _topics_changed(self, topics):
@@ -552,6 +565,22 @@ class BalancedConsumer():
             return
         log.debug("Rebalance triggered by topic change")
         self._rebalance()
+
+    def _zookeeper_state_changed(self, state):
+        if state in (KazooState.LOST, KazooState.SUSPENDED):
+            self._setting_watches = True
+            self._zookeeper_connected = False
+        elif (state == KazooState.CONNECTED and
+              self._setting_watches and self._running):
+            def rebalance():
+                try:
+                    self._rebalance()
+                    self._setting_watches = False
+                    self._zookeeper_connected = True
+                except Exception:
+                    self.stop(commit_offsets=False)
+                    raise
+            self._cluster.handler.spawn(rebalance)
 
     def reset_offsets(self, partition_offsets=None):
         """Reset offsets for the specified partitions
@@ -585,7 +614,7 @@ class BalancedConsumer():
         message = None
         self._last_message_time = time.time()
         while message is None and not consumer_timed_out():
-            if not self._zookeeper.connected:
+            if not self._zookeeper_connected:
                 self.stop(commit_offsets=False)
                 raise ZookeeperConnectionLost()
             try:
