@@ -446,7 +446,7 @@ class BalancedConsumer():
                     if self._consumer_id not in participants:
                         self._consumer.stop()
                         # zookeeper failure, all ephemeral nodes for this consumer should be
-                        # missing.
+                        # missing, therefore we must not call _remove_partitions.
                         self._partitions -= self._partitions
                         # If the zookeeper connection dies, the consumer's ID is removed from
                         # zookeeper's registry. When the zookeeper connection is regained, the
@@ -621,11 +621,10 @@ class BalancedConsumer():
                 message = self._consumer.consume(block=block)
             except ConsumerStoppedException:
                 # don't raise the exception if we're rebalancing
-                if self._rebalancing_lock.locked():
-                    continue
                 # rebalancing has been finished
-                if self._consumer.running:
+                if self._rebalancing_lock.locked() or self._consumer.running:
                     continue
+                self.stop()
                 raise
             if message:
                 self._last_message_time = time.time()
