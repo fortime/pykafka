@@ -617,6 +617,8 @@ class BalancedConsumer():
             if not self._zookeeper_connected:
                 self.stop(commit_offsets=False)
                 raise ZookeeperConnectionLost()
+            if not (self._consumer.running or self._rebalancing_lock.locked()):
+                self.stop()
             try:
                 message = self._consumer.consume(block=block)
             except ConsumerStoppedException:
@@ -624,7 +626,6 @@ class BalancedConsumer():
                 # rebalancing has been finished
                 if self._rebalancing_lock.locked() or self._consumer.running:
                     continue
-                self.stop()
                 raise
             if message:
                 self._last_message_time = time.time()
