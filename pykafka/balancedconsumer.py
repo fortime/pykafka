@@ -187,7 +187,11 @@ class BalancedConsumer():
         if zookeeper is not None:
             self._zookeeper = zookeeper
         if auto_start is True:
-            self.start()
+            try:
+                self.start()
+            except Exception:
+                self.stop(commit_offsets=False)
+                raise
 
     def __repr__(self):
         return "<{module}.{name} at {id_} (consumer_group={group})>".format(
