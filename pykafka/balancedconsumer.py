@@ -186,6 +186,7 @@ class BalancedConsumer():
         self._zookeeper_connected = False
         if zookeeper is not None:
             self._zookeeper = zookeeper
+        self._running = False
         if auto_start is True:
             try:
                 self.start()
@@ -231,6 +232,7 @@ class BalancedConsumer():
 
     def start(self):
         """Open connections and join a cluster."""
+        self._running = True
         if self._zookeeper is None:
             self._setup_zookeeper(self._zookeeper_connect,
                                   self._zookeeper_connection_timeout_ms)
@@ -238,7 +240,6 @@ class BalancedConsumer():
         self._add_self()
         self._set_watches()
         self._rebalance()
-        self._running = True
         self._setup_checker_worker()
 
     def stop(self, commit_offsets=True):
