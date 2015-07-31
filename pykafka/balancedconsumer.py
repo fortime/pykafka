@@ -250,8 +250,10 @@ class BalancedConsumer():
         # To avoid a race condition, set this consumer to not running before
         # stopping internal consumer.
         self._running = False
-        if self._consumer is not None:
-            self._consumer.stop(commit_offsets=commit_offsets)
+        with self._rebalancing_lock:
+            # stop after current rebalance finished.
+            if self._consumer is not None:
+                self._consumer.stop(commit_offsets=commit_offsets)
         if self._owns_zookeeper:
             self._zookeeper.stop()
 
@@ -431,6 +433,10 @@ class BalancedConsumer():
 
         This method is called whenever a zookeeper watch is triggered.
         """
+        # check if it is running
+        if not self._running:
+            return
+
         if self._consumer is not None:
             self.commit_offsets()
         with self._rebalancing_lock:
@@ -439,6 +445,8 @@ class BalancedConsumer():
             )
 
             for i in xrange(self._rebalance_max_retries):
+                if not self._running:
+                    return
                 try:
                     # If retrying, be sure to make sure the
                     # partition allocation is correct.
@@ -549,18 +557,28 @@ class BalancedConsumer():
             self._rebalance()
 
     def _brokers_changed(self, brokers):
+        if not self._running:
+            # return False to remove this callback.
+            return False
         if self._setting_watches:
             return
         log.debug("Rebalance triggered by broker change")
         self._rebalance()
+        # return True to remove this callback
 
     def _consumers_changed(self, consumers):
+        if not self._running:
+            # return False to remove this callback.
+            return False
         if self._setting_watches:
             return
         log.debug("Rebalance triggered by consumer change")
         self._rebalance()
 
     def _topics_changed(self, topics):
+        if not self._running:
+            # return False to remove this callback.
+            return False
         if self._setting_watches:
             return
         log.debug("Rebalance triggered by topic change")
@@ -581,6 +599,8 @@ class BalancedConsumer():
                     self.stop(commit_offsets=False)
                     raise
             self._cluster.handler.spawn(rebalance)
+        # return True to remove this callback
+        return not self._running
 
     def reset_offsets(self, partition_offsets=None):
         """Reset offsets for the specified partitions
@@ -619,6 +639,7 @@ class BalancedConsumer():
                 raise ZookeeperConnectionLost()
             if not (self._consumer.running or self._rebalancing_lock.locked()):
                 self.stop()
+                raise ConsumerStoppedException()
             try:
                 message = self._consumer.consume(block=block)
             except ConsumerStoppedException:
