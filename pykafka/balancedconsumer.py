@@ -510,7 +510,7 @@ class BalancedConsumer():
         for p in partitions:
             assert p in self._partitions
             self._zookeeper.delete(self._path_from_partition(p))
-        self._partitions -= partitions
+            self._partitions.discard(p)
 
     def _add_partitions(self, partitions):
         """Add partitions to the zookeeper registry for this consumer.
