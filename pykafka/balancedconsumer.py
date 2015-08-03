@@ -636,14 +636,12 @@ class BalancedConsumer():
 
     def _zookeeper_state_changed(self, state):
         if state in (KazooState.LOST, KazooState.SUSPENDED):
-            self._setting_watches = True
             self._zookeeper_connected = False
         elif (state == KazooState.CONNECTED and
-                self._setting_watches and self._running):
+                not self._zookeeper_connected and self._running):
             def rebalance():
                 try:
                     self._rebalance()
-                    self._setting_watches = False
                     self._zookeeper_connected = True
                 except Exception:
                     self.stop(commit_offsets=False)

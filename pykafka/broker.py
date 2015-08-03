@@ -173,11 +173,16 @@ class Broker():
         Creates a new :class:`pykafka.connection.BrokerConnection` and a new
         :class:`pykafka.handlers.RequestHandler` for this broker
         """
-        self._connection = BrokerConnection(self.host, self.port,
-                                            self._buffer_size)
-        self._connection.connect(self._socket_timeout_ms)
-        self._req_handler = RequestHandler(self._handler, self._connection)
-        self._req_handler.start()
+        if self._connection is None:
+            self._connection = BrokerConnection(self.host, self.port,
+                                                self._buffer_size)
+            self._connection.connect(self._socket_timeout_ms)
+        elif not self._connection.connected:
+            self._connection.connect(self._socket_timeout_ms)
+
+        if self._req_handler is None:
+            self._req_handler = RequestHandler(self._handler, self._connection)
+            self._req_handler.start()
 
     def connect_offsets_channel(self):
         """Establish a connection to the Broker for the offsets channel
@@ -186,13 +191,18 @@ class Broker():
         :class:`pykafka.handlers.RequestHandler` for this broker's offsets
         channel
         """
-        self._offsets_channel_connection = BrokerConnection(self.host, self.port,
-                                                            self._buffer_size)
-        self._offsets_channel_connection.connect(self._offsets_channel_socket_timeout_ms)
-        self._offsets_channel_req_handler = RequestHandler(
-            self._handler, self._offsets_channel_connection
-        )
-        self._offsets_channel_req_handler.start()
+        if self._offsets_channel_connection is None:
+            self._offsets_channel_connection = BrokerConnection(self.host, self.port,
+                                                                self._buffer_size)
+            self._offsets_channel_connection.connect(self._offsets_channel_socket_timeout_ms)
+        elif not self._offsets_channel_connection.connected:
+            self._offsets_channel_connection.connect(self._offsets_channel_socket_timeout_ms)
+
+        if self._offsets_channel_req_handler is None:
+            self._offsets_channel_req_handler = RequestHandler(
+                self._handler, self._offsets_channel_connection
+            )
+            self._offsets_channel_req_handler.start()
 
     def fetch_messages(self,
                        partition_requests,
@@ -212,6 +222,9 @@ class Broker():
             block for up to `timeout` milliseconds.
         :type min_bytes: int
         """
+        if not self._connection.connected:
+            self.connect()
+
         future = self._req_handler.request(FetchRequest(
             partition_requests=partition_requests,
             timeout=timeout,
@@ -227,6 +240,9 @@ class Broker():
             produce
         :type produce_request: :class:`pykafka.protocol.ProduceRequest`
         """
+        if not self._connection.connected:
+            self.connect()
+
         if produce_request.required_acks == 0:
             self._req_handler.request(produce_request, has_response=False)
         else:
@@ -241,6 +257,9 @@ class Broker():
         :type partition_requests: Iterable of
             :class:`pykafka.protocol.PartitionOffsetRequest`
         """
+        if not self._connection.connected:
+            self.connect()
+
         future = self._req_handler.request(OffsetRequest(partition_requests))
         return future.get(OffsetResponse)
 
@@ -250,6 +269,9 @@ class Broker():
         :param topics: The topic ids for which to request metadata
         :type topics: Iterable of int
         """
+        if not self._connection.connected:
+            self.connect()
+
         max_retries = 3
         for i in xrange(max_retries):
             if i > 0:
