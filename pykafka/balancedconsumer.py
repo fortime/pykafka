@@ -254,13 +254,17 @@ class BalancedConsumer():
         # consume() will re-setup the internal consumer.
         # To avoid a race condition, set this consumer to not running before
         # stopping internal consumer.
+        log.info('Stop consumer %s', self._consumer_id)
         self._running = False
         with self._rebalancing_lock:
             # stop after current rebalance finished.
             if self._consumer is not None:
                 self._consumer.stop(commit_offsets=commit_offsets)
-        if self._owns_zookeeper:
-            self._zookeeper.stop()
+
+            if self._owns_zookeeper:
+                self._zookeeper.stop()
+            else:
+                self._clear()
 
     @property
     def running(self):
@@ -433,6 +437,47 @@ class BalancedConsumer():
         self._zookeeper.create(
             path, self._topic.name, ephemeral=True, makepath=True)
 
+    def _remove_self(self):
+        """Remove itself from zookeeper.
+        """
+        # ensure this consumer is in zookeeper.
+        participants = self._get_participants()
+        if self._consumer_id not in participants:
+            return
+
+        path = '{path}/{id_}'.format(
+            path=self._consumer_id_path,
+            id_=self._consumer_id
+        )
+        self._zookeeper.delete(path)
+
+    def _remove_owned_partitions(self):
+        """Remove owned partitions
+        """
+        all_partitions = self._zookeeper.get_children(self._topic_path)
+        for partition_slug in all_partitions:
+            owner_id, stat = self._zookeeper.get(
+                '{path}/{slug}'.format(
+                    path=self._topic_path, slug=partition_slug))
+            if owner_id == self._consumer_id:
+                self._zookeeper.delete(
+                        '{path}/{slug}'.format(
+                            path=self._topic_path, slug=partition_slug))
+
+    def _clear(self):
+        """Clear all ephemeral nodes.
+        """
+        try:
+            self._remove_owned_partitions()
+        except Exception:
+            log.warn('Clear owned partitions for consumer %s failed',
+                    self._consumer_id, exc_info=True)
+        try:
+            self._remove_self()
+        except Exception:
+            log.warn('Clear consumer_id %s failed',
+                    self._consumer_id, exc_info=True)
+
     def _rebalance(self):
         """Claim partitions for this consumer.
 
@@ -594,7 +639,7 @@ class BalancedConsumer():
             self._setting_watches = True
             self._zookeeper_connected = False
         elif (state == KazooState.CONNECTED and
-              self._setting_watches and self._running):
+                self._setting_watches and self._running):
             def rebalance():
                 try:
                     self._rebalance()
@@ -604,6 +649,13 @@ class BalancedConsumer():
                     self.stop(commit_offsets=False)
                     raise
             self._cluster.handler.spawn(rebalance)
+
+        if (state == KazooState.CONNECTED and
+                not self._running):
+            def clear():
+                self._clear()
+            self._cluster.handler.spawn(clear)
+
         # return True to remove this callback
         return not self._running
 
