@@ -18,11 +18,15 @@ limitations under the License.
 """
 __all__ = ["ResponseFuture", "Handler", "ThreadingHandler", "RequestHandler"]
 import atexit
+import logging
 import threading
 import Queue
 
 from collections import namedtuple
+from .exceptions import HandlerStoppedException
 
+log = logging.getLogger(__name__)
+_STOP = object()
 
 class ResponseFuture(object):
     """A response which may have a value at some point."""
@@ -57,6 +61,10 @@ class ResponseFuture(object):
             return response_cls(self.response)
         else:
             return self.response
+
+    @property
+    def ready(self):
+        return self._ready.is_set()
 
 
 class Handler(object):
@@ -93,7 +101,10 @@ class RequestHandler(object):
         self.handler = handler
         self.connection = connection
         self._requests = handler.Queue()
-        self.ending = handler.Event()
+        self.ending = False
+        self.ended = handler.Event()
+        self.t = None
+        self.log = log
         atexit.register(self.stop)
 
     def request(self, request, has_response=True):
@@ -103,12 +114,19 @@ class RequestHandler(object):
         :param has_response: Whether this request will return a response
         :returns: :class:`pykafka.handlers.ResponseFuture`
         """
+        if self.ending:
+            raise HandlerStoppedException('This handler has stopped.')
+
         future = None
         if has_response:
             future = ResponseFuture(self.handler)
 
         task = self.Task(request, future)
         self._requests.put(task)
+
+        # check if this handler has stopped.
+        if self.ending and future and not future.ready:
+            raise HandlerStoppedException('This handler has stopped after putting task.')
         return future
 
     def start(self):
@@ -117,22 +135,52 @@ class RequestHandler(object):
 
     def stop(self):
         """Stop the request processor."""
+        if self.ending:
+            return
+
+        self.ending = True
         self._requests.join()
-        self.ending.set()
+        self.ended.set()
+        # tell worker thread to stop.
+        self._requests.put(_STOP)
+        if self.t:
+            self.t.join()
+            self.t = None
 
     def _start_thread(self):
         """Run the request processor"""
         def worker():
-            while not self.ending.is_set():
-                task = self._requests.get()
+            future = None
+            try:
+                while not self.ended.is_set():
+                    task = self._requests.get()
+                    if task is _STOP:
+                        break
+                    future = task.future
+                    try:
+                        self.connection.request(task.request)
+                        if task.future:
+                            res = self.connection.response()
+                            task.future.set_response(res)
+                    except Exception, e:
+                        if task.future:
+                            task.future.set_error(e)
+                    finally:
+                        self._requests.task_done()
+            except Exception as exc:
+                log.warn('Exception happened in worker thread of pykafka handler.', exc_info=True)
+                if future and not future.ready:
+                    future.set_error(exc)
+            finally:
+                self.ended.set()
+                self.ending = True
+                # clear all self._requests
                 try:
-                    self.connection.request(task.request)
-                    if task.future:
-                        res = self.connection.response()
-                        task.future.set_response(res)
-                except Exception, e:
-                    if task.future:
-                        task.future.set_error(e)
-                finally:
-                    self._requests.task_done()
+                    while True:
+                        # it will raise an exception finally.
+                        self._requests.task_done()
+                except Exception:
+                    # value error
+                    log.info('Worker thread of pykafka handler exits')
+
         return self.handler.spawn(worker)

@@ -174,7 +174,7 @@ class KafkaInstance(ManagedInstance):
         log.info('Downloading Kafka.')
         curr_dir = os.getcwd()
         os.chdir(self._bin_dir)
-        url = 'http://mirror.reverse.net/pub/apache/kafka/{version}/kafka_2.10-{version}.tgz'.format(version=self._kafka_version)
+        url = 'http://mirror.bit.edu.cn/apache/kafka/0.8.2.1/kafka_2.10-{version}.tgz'.format(version=self._kafka_version)
         p1 = subprocess.Popen(['curl', '-vs', url], stdout=subprocess.PIPE)
         p2 = subprocess.Popen(['tar', 'xvz', '-C', self._bin_dir, '--strip-components', '1'], stdin=p1.stdout, stdout=subprocess.PIPE)
         p1.stdout.close()

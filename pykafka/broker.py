@@ -204,6 +204,19 @@ class Broker():
             )
             self._offsets_channel_req_handler.start()
 
+    def disconnect(self):
+        if self._offsets_channel_req_handler is not None:
+            self._offsets_channel_req_handler.stop()
+
+        if self._offsets_channel_connection is not None:
+            self._offsets_channel_connection.disconnect()
+
+        if self._req_handler is not None:
+            self._req_handler.stop()
+
+        if self._connection is not None:
+            self._connection.disconnect()
+
     def fetch_messages(self,
                        partition_requests,
                        timeout=30000,

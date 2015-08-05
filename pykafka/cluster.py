@@ -152,6 +152,7 @@ class Cluster(object):
                                     self._offsets_channel_socket_timeout_ms,
                                     buffer_size=1024 * 1024)
                     response = broker.request_metadata()
+                    broker.disconnect()
                     if response is not None:
                         return response
                 except:
@@ -174,7 +175,8 @@ class Cluster(object):
             log.info('Removing %d brokers', len(removed))
         for id_ in removed:
             log.debug('Removing broker %s', self._brokers[id_])
-            self._brokers.pop(id_)
+            broker = self._brokers.pop(id_)
+            broker.disconnect()
         # Add/update current brokers
         if len(broker_metadata) > 0:
             log.info('Discovered %d brokers', len(broker_metadata))

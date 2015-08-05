@@ -55,6 +55,11 @@ class ZookeeperConnectionLost(KafkaException):
     pass
 
 
+class HandlerStoppedException(KafkaException):
+    """Indicates that the handler of broker has been unexpectedly stopped"""
+    pass
+
+
 class PartitionOwnedError(KafkaException):
     """Indicates a given partition is still owned in Zookeeper."""
 

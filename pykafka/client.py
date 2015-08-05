@@ -95,3 +95,10 @@ class KafkaClient(object):
         with current metadata from the cluster.
         """
         self.cluster.update()
+
+    def stop(self):
+        for id_, broker in self.brokers.iteritems():
+            try:
+                broker.disconnect()
+            except Exception:
+                log.warn('Disconnect broker %s failed', str(id_), exc_info=True)

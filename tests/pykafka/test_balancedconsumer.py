@@ -41,6 +41,7 @@ class TestBalancedConsumer(unittest2.TestCase):
         """
         self._mock_consumer._setup_internal_consumer(start=False)
         self._mock_consumer._consumer._running = True
+        self._mock_consumer._zookeeper_connected = True
         start = time.time()
         self._mock_consumer.consume()
         self.assertEqual(int(time.time() - start), int(self._consumer_timeout / 1000))
