@@ -520,7 +520,7 @@ class SimpleConsumer():
                     by_leader[partition.partition.leader].append((partition, offset))
 
             # reset this dict to prepare it for next retry
-            owned_partition_offsets = {}
+            tmp_owned_partition_offsets = {}
 
             # get valid offset ranges for each partition
             for broker, offsets in by_leader.iteritems():
@@ -548,8 +548,10 @@ class SimpleConsumer():
                     (part, owned_partition_offsets[part])
                     for errcode, parts in parts_by_error.iteritems()
                     for part, _ in parts)
-                owned_partition_offsets = dict(errored_partitions.items() +
-                                               owned_partition_offsets.items())
+                tmp_owned_partition_offsets = dict(errored_partitions.items() +
+                                               tmp_owned_partition_offsets.items())
+
+            owned_partition_offsets = tmp_owned_partition_offsets
 
             for errcode, owned_partitions in parts_by_error.iteritems():
                 if errcode != 0:
