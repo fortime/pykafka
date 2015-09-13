@@ -21,7 +21,7 @@ import logging
 import time
 
 from .connection import BrokerConnection
-from .exceptions import LeaderNotAvailable
+from .exceptions import LeaderNotAvailable, HandlerStoppedException
 from .handlers import RequestHandler
 from .protocol import (
     FetchRequest, FetchResponse, OffsetRequest,
@@ -79,6 +79,8 @@ class Broker():
         self._socket_timeout_ms = socket_timeout_ms
         self._offsets_channel_socket_timeout_ms = offsets_channel_socket_timeout_ms
         self._buffer_size = buffer_size
+        self._is_started = True
+        self._handler_lock = handler.Lock()
         self.connect()
 
     def __repr__(self):
@@ -127,14 +129,16 @@ class Broker():
         """Returns True if this object's main connection to the Kafka broker
             is active
         """
-        return self._connection.connected
+        if self._is_started and self._connection:
+            return self._connection.connected
+        return False
 
     @property
     def offsets_channel_connected(self):
         """Returns True if this object's offsets channel connection to the
             Kafka broker is active
         """
-        if self._offsets_channel_connection:
+        if self._is_started and self._offsets_channel_connection:
             return self._offsets_channel_connection.connected
         return False
 
@@ -176,16 +180,23 @@ class Broker():
         Creates a new :class:`pykafka.connection.BrokerConnection` and a new
         :class:`pykafka.handlers.RequestHandler` for this broker
         """
-        if self._connection is None:
-            self._connection = BrokerConnection(self.host, self.port,
-                                                self._buffer_size)
-            self._connection.connect(self._socket_timeout_ms)
-        elif not self._connection.connected:
-            self._connection.connect(self._socket_timeout_ms)
+        if not self._is_started:
+            raise HandlerStoppedException('Broker has stop!')
 
-        if self._req_handler is None:
-            self._req_handler = RequestHandler(self._handler, self._connection)
-            self._req_handler.start()
+        self._handler_lock.acquire(True)
+        try:
+            if self._connection is None:
+                self._connection = BrokerConnection(self.host, self.port,
+                                                    self._buffer_size)
+                self._connection.connect(self._socket_timeout_ms)
+            elif not self._connection.connected:
+                self._connection.connect(self._socket_timeout_ms)
+
+            if self._req_handler is None:
+                self._req_handler = RequestHandler(self._handler, self._connection)
+                self._req_handler.start()
+        finally:
+            self._handler_lock.release()
 
     def connect_offsets_channel(self):
         """Establish a connection to the Broker for the offsets channel
@@ -194,35 +205,48 @@ class Broker():
         :class:`pykafka.handlers.RequestHandler` for this broker's offsets
         channel
         """
-        if self._offsets_channel_connection is None:
-            self._offsets_channel_connection = BrokerConnection(self.host, self.port,
-                                                                self._buffer_size)
-            self._offsets_channel_connection.connect(self._offsets_channel_socket_timeout_ms)
-        elif not self._offsets_channel_connection.connected:
-            self._offsets_channel_connection.connect(self._offsets_channel_socket_timeout_ms)
+        if not self._is_started:
+            raise HandlerStoppedException('Broker has stop!')
 
-        if self._offsets_channel_req_handler is None:
-            self._offsets_channel_req_handler = RequestHandler(
-                self._handler, self._offsets_channel_connection
-            )
-            self._offsets_channel_req_handler.start()
+        self._handler_lock.acquire(True)
+        try:
+            if self._offsets_channel_connection is None:
+                self._offsets_channel_connection = BrokerConnection(self.host, self.port,
+                                                                    self._buffer_size)
+                self._offsets_channel_connection.connect(self._offsets_channel_socket_timeout_ms)
+            elif not self._offsets_channel_connection.connected:
+                self._offsets_channel_connection.connect(self._offsets_channel_socket_timeout_ms)
+
+            if self._offsets_channel_req_handler is None:
+                self._offsets_channel_req_handler = RequestHandler(
+                    self._handler, self._offsets_channel_connection
+                )
+                self._offsets_channel_req_handler.start()
+        finally:
+            self._handler_lock.release()
 
     def disconnect(self):
-        if self._offsets_channel_req_handler is not None:
-            self._offsets_channel_req_handler.stop()
-            self._offsets_channel_req_handler = None
+        self._handler_lock.acquire(True)
+        try:
+            self._is_started = False
 
-        if self._offsets_channel_connection is not None:
-            self._offsets_channel_connection.disconnect()
-            self._offsets_channel_connection = None
+            if self._offsets_channel_req_handler is not None:
+                self._offsets_channel_req_handler.stop()
+                self._offsets_channel_req_handler = None
 
-        if self._req_handler is not None:
-            self._req_handler.stop()
-            self._req_handler = None
+            if self._offsets_channel_connection is not None:
+                self._offsets_channel_connection.disconnect()
+                self._offsets_channel_connection = None
 
-        if self._connection is not None:
-            self._connection.disconnect()
-            self._connection = None
+            if self._req_handler is not None:
+                self._req_handler.stop()
+                self._req_handler = None
+
+            if self._connection is not None:
+                self._connection.disconnect()
+                self._connection = None
+        finally:
+            self._handler_lock.release()
 
     def fetch_messages(self,
                        partition_requests,
@@ -242,7 +266,7 @@ class Broker():
             block for up to `timeout` milliseconds.
         :type min_bytes: int
         """
-        if not self._connection.connected:
+        if not self.connected:
             self.connect()
 
         future = self._req_handler.request(FetchRequest(
@@ -260,7 +284,7 @@ class Broker():
             produce
         :type produce_request: :class:`pykafka.protocol.ProduceRequest`
         """
-        if not self._connection.connected:
+        if not self.connected:
             self.connect()
 
         if produce_request.required_acks == 0:
@@ -277,7 +301,7 @@ class Broker():
         :type partition_requests: Iterable of
             :class:`pykafka.protocol.PartitionOffsetRequest`
         """
-        if not self._connection.connected:
+        if not self.connected:
             self.connect()
 
         future = self._req_handler.request(OffsetRequest(partition_requests))
@@ -289,7 +313,7 @@ class Broker():
         :param topics: The topic ids for which to request metadata
         :type topics: Iterable of int
         """
-        if not self._connection.connected:
+        if not self.connected:
             self.connect()
 
         max_retries = 3
@@ -347,7 +371,8 @@ class Broker():
                                   consumer_group_generation_id,
                                   consumer_id,
                                   partition_requests=preqs)
-        return self._offsets_channel_req_handler.request(req).get(OffsetCommitResponse)
+        future = self._offsets_channel_req_handler.request(req)
+        return future.get(OffsetCommitResponse)
 
     def fetch_consumer_group_offsets(self, consumer_group, preqs):
         """Fetch the offsets stored in Kafka with the Offset Commit/Fetch API

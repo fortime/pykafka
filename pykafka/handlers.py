@@ -147,6 +147,19 @@ class RequestHandler(object):
             self.t.join()
             self.t = None
 
+    def _flush(self):
+        while True:
+            # it will raise an exception finally.
+            try:
+                task = self._requests.get(block=False)
+            except Exception:
+                break
+            if task is _STOP:
+                self._requests.task_done()
+                continue
+            task.set_error(HandlerStoppedException('This handler has stopped'))
+            self._requests.task_done()
+
     def _start_thread(self):
         """Run the request processor"""
         def worker():
@@ -155,6 +168,7 @@ class RequestHandler(object):
                 while not self.ended.is_set():
                     task = self._requests.get()
                     if task is _STOP:
+                        self._requests.task_done()
                         break
                     future = task.future
                     try:
@@ -162,7 +176,7 @@ class RequestHandler(object):
                         if task.future:
                             res = self.connection.response()
                             task.future.set_response(res)
-                    except Exception, e:
+                    except Exception as e:
                         if task.future:
                             task.future.set_error(e)
                     finally:
@@ -175,12 +189,6 @@ class RequestHandler(object):
                 self.ended.set()
                 self.ending = True
                 # clear all self._requests
-                try:
-                    while True:
-                        # it will raise an exception finally.
-                        self._requests.task_done()
-                except Exception:
-                    # value error
-                    log.info('Worker thread of pykafka handler exits')
-
+                self._flush()
+                log.info('Worker thread of pykafka handler exits')
         return self.handler.spawn(worker)

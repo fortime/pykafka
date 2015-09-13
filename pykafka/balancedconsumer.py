@@ -64,7 +64,7 @@ class BalancedConsumer():
                  offsets_commit_max_retries=5,
                  auto_offset_reset=OffsetType.LATEST,
                  consumer_timeout_ms=-1,
-                 rebalance_max_retries=5,
+                 rebalance_max_retries=40,
                  rebalance_backoff_ms=2 * 1000,
                  zookeeper_connection_timeout_ms=6 * 1000,
                  zookeeper_connect='127.0.0.1:2181',
@@ -173,6 +173,7 @@ class BalancedConsumer():
             uuid=uuid4()
         )
         self._partitions = set()
+        self._broker_ids = set()
         self._setting_watches = True
 
         self._topic_path = '/consumers/{group}/owners/{topic}'.format(
@@ -211,24 +212,27 @@ class BalancedConsumer():
                     if not self._running:
                         break
                     self._check_held_partitions()
+            except Exception:
+                log.warn('Checking held partitions error', exc_info=True)
             finally:
                 if self._running:
                     self.stop()
-            log.debug("Checker thread exiting")
-        log.debug("Starting checker thread")
+            log.info("Checker thread exiting")
+        log.info("Starting checker thread")
         return self._cluster.handler.spawn(checker)
 
     @property
     def partitions(self):
-        return self._consumer.partitions if self._consumer else None
+        if not self._consumer:
+            return {}
+        return self._consumer.partitions
 
     @property
     def held_offsets(self):
         """Return a map from partition id to held offset for each partition"""
         if not self._consumer:
-            return None
-        return dict((p.partition.id, p.last_offset_consumed)
-                    for p in self._consumer._partitions_by_id.itervalues())
+            return {}
+        return self._consumer.held_offsets
 
     def start(self):
         """Open connections and join a cluster."""
@@ -352,7 +356,7 @@ class BalancedConsumer():
         new_partitions = set(new_partitions)
         log.info('Balancing %i participants for %i partitions.\nOwning %i partitions.',
                  len(participants), len(all_parts), len(new_partitions))
-        log.debug('My partitions: %s', [p_to_str(p) for p in new_partitions])
+        log.info('My partitions: %s', [p_to_str(p) for p in new_partitions])
         return new_partitions
 
     def _get_participants(self):
@@ -391,6 +395,7 @@ class BalancedConsumer():
         # Set all our watches and then rebalance
         broker_path = '/brokers/ids'
         try:
+            # if brokers has changed, i think i should restart the consumer.
             self._broker_watcher = ChildrenWatch(
                 self._zookeeper, broker_path,
                 self._brokers_changed
@@ -401,11 +406,12 @@ class BalancedConsumer():
                 'ZooKeeper cluster -- is your Kafka cluster running?'
                 % broker_path)
 
-        self._topics_watcher = ChildrenWatch(
-            self._zookeeper,
-            '/brokers/topics',
-            self._topics_changed
-        )
+        # TODO not necessary
+        #self._topics_watcher = ChildrenWatch(
+        #    self._zookeeper,
+        #    '/brokers/topics',
+        #    self._topics_changed
+        #)
 
         self._consumer_watcher = ChildrenWatch(
             self._zookeeper, self._consumer_id_path,
@@ -456,19 +462,29 @@ class BalancedConsumer():
         """
         all_partitions = self._zookeeper.get_children(self._topic_path)
         for partition_slug in all_partitions:
-            owner_id, stat = self._zookeeper.get(
-                '{path}/{slug}'.format(
-                    path=self._topic_path, slug=partition_slug))
+            try:
+                owner_id, stat = self._zookeeper.get(
+                    '{path}/{slug}'.format(
+                        path=self._topic_path, slug=partition_slug))
+            except NoNodeException:
+                continue
             if owner_id == self._consumer_id:
-                self._zookeeper.delete(
-                        '{path}/{slug}'.format(
-                            path=self._topic_path, slug=partition_slug))
+                try:
+                    self._zookeeper.delete(
+                            '{path}/{slug}'.format(
+                                path=self._topic_path, slug=partition_slug))
+                except NoNodeException:
+                    log.warn('Partition %s of %s does not exist when removing '
+                            'owned partitions.',
+                            str(partition_slug), self._consumer_id)
 
     def _clear(self):
         """Clear all ephemeral nodes.
         """
         try:
-            self._remove_owned_partitions()
+            if self._zookeeper.exists(self._topic_path):
+                self._remove_owned_partitions()
+            self._partitions = set()
         except Exception:
             log.warn('Clear owned partitions for consumer %s failed',
                     self._consumer_id, exc_info=True)
@@ -558,8 +574,15 @@ class BalancedConsumer():
         :type partitions: Iterable of :class:`pykafka.partition.Partition`
         """
         for p in partitions:
-            assert p in self._partitions
-            self._zookeeper.delete(self._path_from_partition(p))
+            try:
+                path = self._path_from_partition(p)
+                owner_id, stat = self._zookeeper.get(path)
+                # make sure consumer_id is the same
+                if owner_id == self._consumer_id:
+                    self._zookeeper.delete(path)
+            except NoNodeException:
+                log.warn('Partition %s of %s does not exist, ignore.',
+                        str(partition_slug), self._consumer_id)
             self._partitions.discard(p)
 
     def _add_partitions(self, partitions):
@@ -592,29 +615,42 @@ class BalancedConsumer():
         zk_partition_ids = set()
         all_partitions = self._zookeeper.get_children(self._topic_path)
         for partition_slug in all_partitions:
-            owner_id, stat = self._zookeeper.get(
-                '{path}/{slug}'.format(
-                    path=self._topic_path, slug=partition_slug))
-            if owner_id == self._consumer_id:
-                zk_partition_ids.add(int(partition_slug.split('-')[1]))
+            try:
+                owner_id, stat = self._zookeeper.get(
+                        '{path}/{slug}'.format(
+                            path=self._topic_path, slug=partition_slug))
+                if owner_id == self._consumer_id:
+                    zk_partition_ids.add(int(partition_slug.split('-')[1]))
+            except NoNodeException:
+                log.warn('Partition %s of %s does not exist when checking held '
+                        'partitions',
+                        str(partition_slug), self._consumer_id)
         # build a set of partition ids we think we own
         internal_partition_ids = set([p.id for p in self._partitions])
         # compare the two sets, rebalance if necessary
         if internal_partition_ids != zk_partition_ids:
             log.warning("Internal partition registry doesn't match ZooKeeper!")
             log.debug("Internal partition ids: %s\nZooKeeper partition ids: %s",
-                      internal_partition_ids, zk_partition_ids)
+                    internal_partition_ids, zk_partition_ids)
             self._rebalance()
 
     def _brokers_changed(self, brokers):
         if not self._running:
             # return False to remove this callback.
             return False
-        if self._setting_watches:
-            return
-        log.debug("Rebalance triggered by broker change")
-        self._rebalance()
-        # return True to remove this callback
+
+        new_broker_ids = set([broker_id for broker_id in brokers])
+        if not self._broker_ids:
+            self._broker_ids += new_broker_ids
+        else:
+            if new_broker_ids != self._broker_ids:
+                log.warn('brokers have changed, stop this consumer, '
+                        'old brokers: %s, new brokers: %s',
+                        str(self._broker_ids), str(new_broker_ids))
+                self.stop()
+
+        # log.debug("Rebalance triggered by broker change")
+        # self._rebalance()
 
     def _consumers_changed(self, consumers):
         if not self._running:
@@ -623,9 +659,18 @@ class BalancedConsumer():
         if self._setting_watches:
             return
         log.debug("Rebalance triggered by consumer change")
-        self._rebalance()
+        try:
+            self._rebalance()
+        except Exception:
+            log.warn('Rebalance failed after consumers changed, stop this consumer',
+                    exc_info=True)
+            self.stop()
+            raise
 
     def _topics_changed(self, topics):
+        """
+        Deprecated.
+        """
         if not self._running:
             # return False to remove this callback.
             return False
@@ -651,7 +696,8 @@ class BalancedConsumer():
         if (state == KazooState.CONNECTED and
                 not self._running):
             def clear():
-                self._clear()
+                with self._rebalancing_lock:
+                    self._clear()
             self._cluster.handler.spawn(clear)
 
         # return True to remove this callback
