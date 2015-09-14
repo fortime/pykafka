@@ -641,7 +641,7 @@ class BalancedConsumer():
 
         new_broker_ids = set([broker_id for broker_id in brokers])
         if not self._broker_ids:
-            self._broker_ids += new_broker_ids
+            self._broker_ids.update(new_broker_ids)
         else:
             if new_broker_ids != self._broker_ids:
                 log.warn('brokers have changed, stop this consumer, '
