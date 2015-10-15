@@ -523,6 +523,7 @@ class SimpleConsumer():
             for partition, offset in owned_partition_offsets.iteritems():
                 # acquire lock for each partition to stop fetching during offset
                 # reset
+                # TODO lock partitions with stable order
                 if partition.fetch_lock.acquire(True):
                     # empty the queue for this partition to avoid sending
                     # emitting messages from the old offset
@@ -539,6 +540,7 @@ class SimpleConsumer():
                             for owned_partition, offset in offsets]
                     response = broker.request_offset_limits(reqs)
                     parts_by_error = handle_partition_responses(
+                        # TODO use this handlers may cause infinity loop
                         self._default_error_handlers,
                         response=response,
                         success_handler=_handle_success,
@@ -606,9 +608,11 @@ class SimpleConsumer():
                 log.info("Fetched %s messages for topic %s",
                         message_count, self._topic.name)
 
+        has_req = False
         for broker, owned_partitions in self._partitions_by_leader.iteritems():
             partition_reqs = {}
             for owned_partition in owned_partitions:
+                # TODO make owned_partition sorted
                 if owned_partition.fetch_lock.acquire(True):
                     partition_reqs[owned_partition] = None
                     if owned_partition.message_count < self._queued_max_messages:
@@ -620,6 +624,7 @@ class SimpleConsumer():
                                   owned_partition.partition.id,
                                   owned_partition.message_count)
             if partition_reqs:
+                has_req = True
                 try:
                     response = broker.fetch_messages(
                         [a for a in partition_reqs.itervalues() if a],
@@ -658,6 +663,10 @@ class SimpleConsumer():
                 # unlock the rest of the partitions
                 for owned_partition in partition_reqs.iterkeys():
                     owned_partition.fetch_lock.release()
+
+        # if there is no request, then sleep a while.
+        if not has_req:
+            time.sleep(1)
 
 
 class OwnedPartition(object):
