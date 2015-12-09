@@ -17,7 +17,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 __all__ = ["ResponseFuture", "Handler", "ThreadingHandler", "RequestHandler"]
-import atexit
 import logging
 import threading
 import Queue
@@ -105,7 +104,6 @@ class RequestHandler(object):
         self.ended = handler.Event()
         self.t = None
         self.log = log
-        atexit.register(self.stop)
 
     def request(self, request, has_response=True):
         """Construct a new request

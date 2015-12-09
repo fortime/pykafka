@@ -18,6 +18,7 @@ limitations under the License.
 """
 __all__ = ["Partition"]
 import logging
+import weakref
 
 from .common import OffsetType
 from .protocol import PartitionOffsetRequest
@@ -50,7 +51,8 @@ class Partition():
         self._leader = leader
         self._replicas = replicas
         self._isr = isr
-        self._topic = topic
+        self._topic = weakref.proxy(topic)
+        self._hash = hash((topic, id_))
 
     def __repr__(self):
         return "<{module}.{name} at {id_} (id={my_id})>".format(
@@ -110,7 +112,7 @@ class Partition():
         return self.fetch_offset_limit(OffsetType.EARLIEST)[0]
 
     def __hash__(self):
-        return hash((self.topic, self.id))
+        return self._hash
 
     def __eq__(self, other):
         return hash(self) == hash(other)

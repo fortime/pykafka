@@ -172,7 +172,7 @@ class SimpleConsumer():
             self._partitions_by_leader[p.partition.leader].append(p)
         self.partition_cycle = itertools.cycle(self._partitions.values())
 
-        self._default_error_handlers = self._build_default_error_handlers()
+        #self._default_error_handlers = self._build_default_error_handlers()
 
         self._running = False
         if self._auto_start:
@@ -269,6 +269,7 @@ class SimpleConsumer():
                 self.commit_offsets()
         except Exception:
             log.warn('Commit offsets failed when stopping this consumer.', exc_info=True)
+        #self._default_error_handlers = None
         self._running = False
 
     def _setup_autocommit_worker(self):
@@ -382,7 +383,7 @@ class SimpleConsumer():
             response = self._offset_manager.commit_consumer_group_offsets(
                 self._consumer_group, 1, 'pykafka', reqs)
             parts_by_error = handle_partition_responses(
-                self._default_error_handlers,
+                self._build_default_error_handlers(),
                 response=response,
                 partitions_by_id=self._partitions_by_id)
             if len(parts_by_error) == 1 and 0 in parts_by_error:
@@ -431,7 +432,7 @@ class SimpleConsumer():
 
             res = self._offset_manager.fetch_consumer_group_offsets(self._consumer_group, reqs)
             parts_by_error = handle_partition_responses(
-                self._default_error_handlers,
+                self._build_default_error_handlers(),
                 response=res,
                 success_handler=_handle_success,
                 partitions_by_id=self._partitions_by_id)
@@ -541,7 +542,7 @@ class SimpleConsumer():
                     response = broker.request_offset_limits(reqs)
                     parts_by_error = handle_partition_responses(
                         # TODO use this handlers may cause infinity loop
-                        self._default_error_handlers,
+                        self._build_default_error_handlers(),
                         response=response,
                         success_handler=_handle_success,
                         partitions_by_id=self._partitions_by_id)
@@ -657,7 +658,7 @@ class SimpleConsumer():
                 # handle the rest of the errors that don't require deadlock
                 # management
                 handle_partition_responses(
-                    self._default_error_handlers,
+                    self._build_default_error_handlers(),
                     parts_by_error=parts_by_error,
                     success_handler=_handle_success)
                 # unlock the rest of the partitions

@@ -41,7 +41,6 @@ def handle_partition_responses(error_handlers,
     :type partitions_by_id: dict
         {int: :class:`pykafka.simpleconsumer.OwnedPartition`}
     """
-    error_handlers = error_handlers.copy()
     if success_handler is not None:
         error_handlers[0] = success_handler
 
