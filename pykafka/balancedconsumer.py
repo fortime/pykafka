@@ -173,7 +173,6 @@ class BalancedConsumer():
             uuid=uuid4()
         )
         self._partitions = set()
-        self._broker_ids = set()
         self._setting_watches = True
 
         self._topic_path = '/consumers/{group}/owners/{topic}'.format(
@@ -639,15 +638,8 @@ class BalancedConsumer():
             # return False to remove this callback.
             return False
 
-        new_broker_ids = set([broker_id for broker_id in brokers])
-        if not self._broker_ids:
-            self._broker_ids.update(new_broker_ids)
-        else:
-            if new_broker_ids != self._broker_ids:
-                log.warn('brokers have changed, stop this consumer, '
-                        'old brokers: %s, new brokers: %s',
-                        str(self._broker_ids), str(new_broker_ids))
-                self.stop()
+        # restart if brokers have changed
+        self.stop()
 
         # log.debug("Rebalance triggered by broker change")
         # self._rebalance()
