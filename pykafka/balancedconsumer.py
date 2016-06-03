@@ -173,6 +173,7 @@ class BalancedConsumer():
             uuid=uuid4()
         )
         self._partitions = set()
+        self._broker_ids = set()
         self._setting_watches = True
 
         self._topic_path = '/consumers/{group}/owners/{topic}'.format(
@@ -263,6 +264,8 @@ class BalancedConsumer():
             # stop after current rebalance finished.
             if self._consumer is not None:
                 self._consumer.stop(commit_offsets=commit_offsets)
+                # clear reference
+                self._consumer = None
 
             if self._owns_zookeeper:
                 self._zookeeper.stop()
@@ -296,7 +299,7 @@ class BalancedConsumer():
         log.info("Resetting internal consumer")
         reset_offset_on_start = self._reset_offset_on_start
         if self._consumer is not None:
-            self._consumer.stop()
+            self._consumer.stop(commit_offsets=False)
             # only use this setting for the first call to
             # _setup_internal_consumer. subsequent calls should not
             # reset the offsets, since they can happen at any time
@@ -517,7 +520,9 @@ class BalancedConsumer():
                     # partition allocation is correct.
                     participants = self._get_participants()
                     if self._consumer_id not in participants:
-                        self._consumer.stop()
+                        # don't commit offsets, because offsets have been commited before
+                        # rebalancing
+                        self._consumer.stop(commit_offsets=False)
                         # zookeeper failure, all ephemeral nodes for this consumer should be
                         # missing, therefore we must not call _remove_partitions.
                         self._partitions -= self._partitions
@@ -639,7 +644,16 @@ class BalancedConsumer():
             return False
 
         # restart if brokers have changed
-        self.stop()
+        new_broker_ids = set([broker_id for broker_id in brokers])
+        if not self._broker_ids:
+            self._broker_ids.update(new_broker_ids)
+        else:
+            if new_broker_ids != self._broker_ids:
+                log.warn('brokers have changed, stop this consumer, '
+                        'old brokers: %s, new brokers: %s',
+                        str(self._broker_ids), str(new_broker_ids))
+                # brokers changed, don't commit offsets
+                self.stop(commit_offsets=False)
 
         # log.debug("Rebalance triggered by broker change")
         # self._rebalance()
@@ -752,4 +766,10 @@ class BalancedConsumer():
 
         Uses the offset commit/fetch API
         """
-        return self._consumer.commit_offsets()
+        orig_internal_consumer = self._consumer
+        with self._rebalancing_lock:
+            # don't commit after rebalancing
+            if self._running and self._consumer is not None\
+                    and orig_internal_consumer == self._consumer:
+                return self._consumer.commit_offsets()
+        return None
