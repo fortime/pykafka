@@ -188,11 +188,13 @@ class BalancedConsumer():
         if zookeeper is not None:
             self._zookeeper = zookeeper
         self._running = False
+        self._rebalanced = False
+        self._old_consumer = None
         if auto_start is True:
             try:
                 self.start()
             except Exception:
-                self.stop(commit_offsets=False)
+                self.stop(commit_offsets=self._auto_commit_enable)
                 raise
 
     def __repr__(self):
@@ -216,7 +218,7 @@ class BalancedConsumer():
                 log.warn('Checking held partitions error', exc_info=True)
             finally:
                 if self._running:
-                    self.stop()
+                    self.stop(commit_offsets=self._auto_commit_enable)
             log.info("Checker thread exiting")
         log.info("Starting checker thread")
         return self._cluster.handler.spawn(checker)
@@ -262,6 +264,17 @@ class BalancedConsumer():
         self._running = False
         with self._rebalancing_lock:
             # stop after current rebalance finished.
+            if self._rebalanced:
+                # after the first rebalancing, self._old_consumer should be
+                # None.
+                if self._old_consumer is not None:
+                    self._old_consumer.stop(commit_offsets=commit_offsets)
+                    self._old_consumer = None
+                self._rebalanced = False
+                # self._consumer is created after rebalanced and haven't been used.
+                # stop it without committing offsets.
+                commit_offsets = False
+
             if self._consumer is not None:
                 self._consumer.stop(commit_offsets=commit_offsets)
                 # clear reference
@@ -289,7 +302,7 @@ class BalancedConsumer():
         self._zookeeper = KazooClient(zookeeper_connect, timeout=timeout / 1000)
         self._zookeeper.start()
 
-    def _setup_internal_consumer(self, start=True):
+    def _setup_internal_consumer(self):
         """Instantiate an internal SimpleConsumer.
 
         If there is already a SimpleConsumer instance held by this object,
@@ -298,8 +311,15 @@ class BalancedConsumer():
         """
         log.info("Resetting internal consumer")
         reset_offset_on_start = self._reset_offset_on_start
+        if not self._rebalanced:
+            self._rebalanced = True
+            self._old_consumer = self._consumer
+        else:
+            # this consumer is created after rebalanced and haven't been used.
+            # stop it without committing offsets.
+            if self._consumer is not None:
+                self._consumer.stop(commit_offsets=False)
         if self._consumer is not None:
-            self._consumer.stop(commit_offsets=False)
             # only use this setting for the first call to
             # _setup_internal_consumer. subsequent calls should not
             # reset the offsets, since they can happen at any time
@@ -321,7 +341,7 @@ class BalancedConsumer():
             offsets_commit_max_retries=self._offsets_commit_max_retries,
             auto_offset_reset=self._auto_offset_reset,
             reset_offset_on_start=reset_offset_on_start,
-            auto_start=start
+            auto_start=False # don't start automatically
         )
 
     def _decide_partitions(self, participants):
@@ -435,7 +455,7 @@ class BalancedConsumer():
         if self._consumer_id in participants:
             return
         if len(self._topic.partitions) <= len(participants):
-            self.stop()
+            self.stop(commit_offsets=self._auto_commit_enable)
             raise KafkaException("Cannot add consumer: more consumers than partitions")
 
         path = '{path}/{id_}'.format(
@@ -505,8 +525,6 @@ class BalancedConsumer():
         if not self._running:
             return
 
-        if self._consumer is not None:
-            self.commit_offsets()
         with self._rebalancing_lock:
             log.info('Rebalancing consumer %s for topic %s.' % (
                 self._consumer_id, self._topic.name)
@@ -520,9 +538,7 @@ class BalancedConsumer():
                     # partition allocation is correct.
                     participants = self._get_participants()
                     if self._consumer_id not in participants:
-                        # don't commit offsets, because offsets have been commited before
-                        # rebalancing
-                        self._consumer.stop(commit_offsets=False)
+                        self._consumer.stop(commit_offsets=self._auto_commit_enable)
                         # zookeeper failure, all ephemeral nodes for this consumer should be
                         # missing, therefore we must not call _remove_partitions.
                         self._partitions -= self._partitions
@@ -653,7 +669,7 @@ class BalancedConsumer():
                         'old brokers: %s, new brokers: %s',
                         str(self._broker_ids), str(new_broker_ids))
                 # brokers changed, don't commit offsets
-                self.stop(commit_offsets=False)
+                self.stop(commit_offsets=self._auto_commit_enable)
 
         # log.debug("Rebalance triggered by broker change")
         # self._rebalance()
@@ -670,7 +686,7 @@ class BalancedConsumer():
         except Exception:
             log.warn('Rebalance failed after consumers changed, stop this consumer',
                     exc_info=True)
-            self.stop()
+            self.stop(commit_offsets=self._auto_commit_enable)
             raise
 
     def _topics_changed(self, topics):
@@ -695,7 +711,7 @@ class BalancedConsumer():
                     self._rebalance()
                     self._zookeeper_connected = True
                 except Exception:
-                    self.stop(commit_offsets=False)
+                    self.stop(commit_offsets=self._auto_commit_enable)
                     raise
             self._cluster.handler.spawn(rebalance)
 
@@ -738,25 +754,38 @@ class BalancedConsumer():
             disp = (time.time() - self._last_message_time) * 1000.0
             return disp > self._consumer_timeout_ms
 
+        if self._rebalanced:
+            # NOTE these codes is meaningless if there are more than one thread
+            # *consume* messages.
+            # internal consumer has changed, stop the old one, because if there is
+            # only one thread consuming messages, all messages have been consumed.
+            # we can commit offsets without being afraid losing messages.
+            with self._rebalancing_lock:
+                if not self._running:
+                    # consumer stopped, do nothing
+                    raise ConsumerStoppedException()
+                if self._rebalanced:
+                    if self._old_consumer is not None:
+                        self._old_consumer.stop(commit_offsets=True)
+                        self._old_consumer = None
+                    # start the new one
+                    self._consumer.start()
+                    self._rebalanced = False
+
         message = None
         self._last_message_time = time.time()
         while message is None and not consumer_timed_out():
             if not self._zookeeper_connected:
-                self.stop(commit_offsets=False)
+                self.stop(commit_offsets=self._auto_commit_enable)
                 raise ZookeeperConnectionLost()
-            if not (self._consumer.running or self._rebalancing_lock.locked()):
-                self.stop()
-                raise ConsumerStoppedException()
             try:
                 message = self._consumer.consume(block=block)
             except ConsumerStoppedException:
-                # don't raise the exception if we're rebalancing
-                # rebalancing has been finished
-                if self._rebalancing_lock.locked() or self._consumer.running:
-                    continue
+                # don't raise the exception if we have rebalanced just now
+                if self._rebalanced:
+                    # self._consumer doesn't start
+                    return None
                 raise
-            if message:
-                self._last_message_time = time.time()
             if not block:
                 return message
         return message
@@ -766,10 +795,14 @@ class BalancedConsumer():
 
         Uses the offset commit/fetch API
         """
-        orig_internal_consumer = self._consumer
         with self._rebalancing_lock:
-            # don't commit after rebalancing
-            if self._running and self._consumer is not None\
-                    and orig_internal_consumer == self._consumer:
-                return self._consumer.commit_offsets()
-        return None
+            # commit old offsets
+            if self._rebalanced:
+                if self._old_consumer is not None:
+                    self._old_consumer.stop(commit_offsets=True)
+                    self._old_consumer = None
+                # start the new one
+                self._consumer.start()
+                self._rebalanced = False
+            else:
+                self._consumer.commit_offsets()

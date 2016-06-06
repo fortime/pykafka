@@ -256,7 +256,7 @@ class SimpleConsumer():
 
     def __del__(self):
         """Stop consumption and workers when object is deleted"""
-        self.stop()
+        self.stop(commit_offsets=self._auto_commit_enable)
 
     def stop(self, commit_offsets=True):
         """Flag all running workers for deletion.
@@ -284,7 +284,7 @@ class SimpleConsumer():
                     time.sleep(self._auto_commit_interval_ms / 1000)
             finally:
                 if self._running:
-                    self.stop()
+                    self.stop(commit_offsets=self._auto_commit_enable)
             log.debug("Autocommitter thread exiting")
         log.debug("Starting autocommitter thread")
         return self._cluster.handler.spawn(autocommitter)
@@ -307,7 +307,7 @@ class SimpleConsumer():
                 log.warn('Fetching messages error', exc_info=True)
             finally:
                 if self._running:
-                    self.stop()
+                    self.stop(commit_offsets=self._auto_commit_enable)
             log.info("Fetcher thread exited")
         log.info("Starting %s fetcher threads", self._num_consumer_fetchers)
         return [self._cluster.handler.spawn(fetcher)
