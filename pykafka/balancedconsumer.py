@@ -785,6 +785,9 @@ class BalancedConsumer():
                 if self._rebalanced:
                     # self._consumer doesn't start
                     return None
+                # internal consumer has been stopped, stop self
+                # there is no need to commit offsets
+                self.stop(commit_offsets=False)
                 raise
             if not block:
                 return message
