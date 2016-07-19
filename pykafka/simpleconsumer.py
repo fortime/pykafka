@@ -32,6 +32,8 @@ from .exceptions import (OffsetOutOfRangeError, UnknownTopicOrPartition,
                          NotCoordinatorForConsumer, SocketDisconnectedError,
                          ConsumerStoppedException, KafkaException,
                          OffsetRequestFailedError, HandlerStoppedException,
+                         UnknownError, NotLeaderForPartition,
+                         RequestTimedOut, OffsetsLoadInProgress,
                          ERROR_CODES)
 from .protocol import (PartitionFetchRequest, PartitionOffsetCommitRequest,
                        PartitionOffsetFetchRequest, PartitionOffsetRequest)
@@ -154,6 +156,7 @@ class SimpleConsumer():
         self._auto_commit_enable = auto_commit_enable
         self._auto_commit_interval_ms = auto_commit_interval_ms
         self._last_auto_commit = time.time()
+        self._update_lock = self._cluster.handler.Lock()
 
         self._discover_offset_manager()
 
@@ -167,9 +170,7 @@ class SimpleConsumer():
         self._partitions_by_id = dict((p.partition.id, p)
                                       for p in self._partitions.itervalues())
         # Organize partitions by leader for efficient queries
-        self._partitions_by_leader = defaultdict(list)
-        for p in self._partitions.itervalues():
-            self._partitions_by_leader[p.partition.leader].append(p)
+        self._setup_partitions_by_leader()
         self.partition_cycle = itertools.cycle(self._partitions.values())
 
         #self._default_error_handlers = self._build_default_error_handlers()
@@ -205,6 +206,19 @@ class SimpleConsumer():
         if self._auto_commit_enable:
             self._autocommit_worker_thread = self._setup_autocommit_worker()
 
+    def _setup_partitions_by_leader(self):
+        self._partitions_by_leader = defaultdict(list)
+        for p in self._partitions.itervalues():
+            self._partitions_by_leader[p.partition.leader].append(p)
+
+    def _update(self):
+        """Update the consumer and cluster after an ERROR_CODE"""
+        # only allow one thread to be updating the consumer at a time
+        with self._update_lock:
+            self._cluster.update()
+            self._setup_partitions_by_leader()
+            self._discover_offset_manager()
+
     def _build_default_error_handlers(self):
         """Set up the error handlers to use for partition errors."""
         def _handle_OffsetOutOfRangeError(parts):
@@ -214,15 +228,33 @@ class SimpleConsumer():
                                    for owned_partition, pres in parts]
             )
 
+        def _handle_RequestTimedOut(parts):
+            log.info("Continuing in response to RequestTimedOut")
+
         def _handle_NotCoordinatorForConsumer(parts):
-            self._discover_offset_manager()
+            log.info("Updating cluster in response to NotCoordinatorForConsumer")
+            self._update()
+
+        def _handle_NotLeaderForPartition(parts):
+            log.info("Updating cluster in response to NotLeaderForPartition")
+            self._update()
+
+        def _handle_OffsetsLoadInProgress(parts):
+            log.info("Continuing in response to OffsetsLoadInProgress")
+
+        def _handle_UnknownError(parts):
+            log.info("Continuing in response to UnknownError")
 
         return {
             UnknownTopicOrPartition.ERROR_CODE: lambda p: raise_error(UnknownTopicOrPartition),
+            UnknownError.ERROR_CODE: _handle_UnknownError,
             OffsetOutOfRangeError.ERROR_CODE: _handle_OffsetOutOfRangeError,
+            NotLeaderForPartition.ERROR_CODE: _handle_NotLeaderForPartition,
             OffsetMetadataTooLarge.ERROR_CODE: lambda p: raise_error(OffsetMetadataTooLarge),
-            NotCoordinatorForConsumer.ERROR_CODE: _handle_NotCoordinatorForConsumer
-        }
+            NotCoordinatorForConsumer.ERROR_CODE: _handle_NotCoordinatorForConsumer,
+            RequestTimedOut.ERROR_CODE: _handle_RequestTimedOut,
+            OffsetsLoadInProgress.ERROR_CODE: _handle_OffsetsLoadInProgress
+            }
 
     def _discover_offset_manager(self):
         """Set the offset manager for this consumer.
@@ -615,7 +647,6 @@ class SimpleConsumer():
             for owned_partition in owned_partitions:
                 # TODO make owned_partition sorted
                 if owned_partition.fetch_lock.acquire(True):
-                    partition_reqs[owned_partition] = None
                     if owned_partition.message_count < self._queued_max_messages:
                         fetch_req = owned_partition.build_fetch_request(
                             self._fetch_message_max_bytes)
@@ -624,6 +655,8 @@ class SimpleConsumer():
                         log.debug("Partition %s above max queued count (queue has %d)",
                                   owned_partition.partition.id,
                                   owned_partition.message_count)
+                        # release lock
+                        owned_partition.fetch_lock.release()
             if partition_reqs:
                 has_req = True
                 try:
@@ -657,13 +690,15 @@ class SimpleConsumer():
                     partition_reqs.pop(owned_partition)
                 # handle the rest of the errors that don't require deadlock
                 # management
-                handle_partition_responses(
-                    self._build_default_error_handlers(),
-                    parts_by_error=parts_by_error,
-                    success_handler=_handle_success)
-                # unlock the rest of the partitions
-                for owned_partition in partition_reqs.iterkeys():
-                    owned_partition.fetch_lock.release()
+                try:
+                    handle_partition_responses(
+                        self._build_default_error_handlers(),
+                        parts_by_error=parts_by_error,
+                        success_handler=_handle_success)
+                finally:
+                    # unlock the rest of the partitions
+                    for owned_partition in partition_reqs.iterkeys():
+                        owned_partition.fetch_lock.release()
 
         # if there is no request, then sleep a while.
         if not has_req:
