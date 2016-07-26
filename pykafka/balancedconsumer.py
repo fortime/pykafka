@@ -360,7 +360,7 @@ class BalancedConsumer():
         :type participants: Iterable of str
         """
         # Freeze and sort partitions so we always have the same results
-        p_to_str = lambda p: '-'.join([p.topic.name, str(p.leader.id), str(p.id)])
+        p_to_str = lambda p: '-'.join([p.topic.name, str(p.id)])
         all_parts = self._topic.partitions.values()
         all_parts.sort(key=p_to_str)
 
@@ -516,7 +516,7 @@ class BalancedConsumer():
             log.warn('Clear consumer_id %s failed',
                     self._consumer_id, exc_info=True)
 
-    def _rebalance(self):
+    def _rebalance(self, check_held_partitions=False):
         """Claim partitions for this consumer.
 
         This method is called whenever a zookeeper watch is triggered.
@@ -525,6 +525,7 @@ class BalancedConsumer():
         if not self._running:
             return
 
+        partitions_changed = False
         with self._rebalancing_lock:
             log.info('Rebalancing consumer %s for topic %s.' % (
                 self._consumer_id, self._topic.name)
@@ -554,6 +555,27 @@ class BalancedConsumer():
 
                     partitions = self._decide_partitions(participants)
 
+                    if check_held_partitions:
+                        log.info("It is thought held partitions are not the same. Compare with zk again.")
+                        # do under rebalancing lock
+                        zk_partition_ids = self._get_held_partition_ids()
+                        # build a set of partition ids we think we own
+                        internal_partition_ids = set([p.id for p in self._partitions])
+                        # compare the two sets, rebalance if necessary
+                        if internal_partition_ids != zk_partition_ids:
+                            partitions_changed = True
+                            ids_on_zk_only = zk_partition_ids - internal_partition_ids
+                            ids_on_self_only = internal_partition_ids - zk_partition_ids
+                            # remove partition ids only on zookeeper
+                            for partition_id in ids_on_zk_only:
+                                self._remove_partition(partition_id)
+                            # remove partition ids only on this consumer.
+                            for p in list(self._partitions):
+                                if (p.id in ids_on_self_only):
+                                    self._partitions.remove(p)
+                        # there is no need to check again
+                        check_held_partitions = False
+
                     old_partitions = self._partitions - partitions
                     self._remove_partitions(old_partitions)
 
@@ -561,7 +583,7 @@ class BalancedConsumer():
                     self._add_partitions(new_partitions)
 
                     # Only re-create internal consumer if something changed.
-                    if old_partitions or new_partitions:
+                    if old_partitions or new_partitions or partitions_changed:
                         self._setup_internal_consumer()
 
                     log.info('Rebalancing Complete.')
@@ -571,18 +593,36 @@ class BalancedConsumer():
                         log.warning('Failed to acquire partition %s after %d retries.',
                                     ex.partition, i)
                         raise
-                    log.info('Unable to acquire partition %s. Retrying', ex.partition)
+                    log.info('Unable to acquire partition %s. Retrying: %d', ex.partition, i)
                     time.sleep(i * (self._rebalance_backoff_ms / 1000))
                 except (ConnectionLoss, ConnectionClosedError):
-                    log.error("Zookeeper connection lost. Retrying.")
+                    log.error("Zookeeper connection lost. Retrying: %d", i)
                     time.sleep(i * (self._rebalance_backoff_ms / 1000))
 
-    def _path_from_partition(self, p):
+    def _path_from_partition(self, partition_id):
         """Given a partition, return its path in zookeeper.
 
-        :type p: :class:`pykafka.partition.Partition`
+        :type partition_id: :class:`int`
         """
-        return "%s/%s-%s" % (self._topic_path, p.leader.id, p.id)
+        # don't know why p.leader.id is added to this string, so I replace
+        # p.leader.id with p just keep the format %s-%s.
+        return "%s/p-%s" % (self._topic_path, partition_id)
+
+    def _remove_partition(self, partition_id):
+        """Remove a partition from the zookeeper registry for this consumer.
+
+        :param partition_id: The partitions to remove.
+        :type partition_id: :class:`int`
+        """
+        try:
+            path = self._path_from_partition(partition_id)
+            owner_id, stat = self._zookeeper.get(path)
+            # make sure consumer_id is the same
+            if owner_id == self._consumer_id:
+                self._zookeeper.delete(path)
+        except NoNodeException:
+            log.warn('Partition %s of %s does not exist, ignore.',
+                    str(partition_id), self._consumer_id)
 
     def _remove_partitions(self, partitions):
         """Remove partitions from the zookeeper registry for this consumer.
@@ -594,15 +634,7 @@ class BalancedConsumer():
         :type partitions: Iterable of :class:`pykafka.partition.Partition`
         """
         for p in partitions:
-            try:
-                path = self._path_from_partition(p)
-                owner_id, stat = self._zookeeper.get(path)
-                # make sure consumer_id is the same
-                if owner_id == self._consumer_id:
-                    self._zookeeper.delete(path)
-            except NoNodeException:
-                log.warn('Partition %s of %s does not exist, ignore.',
-                        str(partition_slug), self._consumer_id)
+            self._remove_partition(p.id)
             self._partitions.discard(p)
 
     def _add_partitions(self, partitions):
@@ -616,7 +648,7 @@ class BalancedConsumer():
         for p in partitions:
             try:
                 self._zookeeper.create(
-                    self._path_from_partition(p),
+                    self._path_from_partition(p.id),
                     value=self._consumer_id,
                     ephemeral=True
                 )
@@ -624,13 +656,9 @@ class BalancedConsumer():
             except NodeExistsError:
                 raise PartitionOwnedError(p)
 
-    def _check_held_partitions(self):
-        """Double-check held partitions against zookeeper
-
-        Ensure that the partitions held by this consumer are the ones that
-        zookeeper thinks it's holding. If not, rebalance.
+    def _get_held_partition_ids(self):
+        """Return owned parition ids
         """
-        log.info("Checking held partitions against ZooKeeper")
         # build a set of partition ids zookeeper says we own
         zk_partition_ids = set()
         all_partitions = self._zookeeper.get_children(self._topic_path)
@@ -645,14 +673,26 @@ class BalancedConsumer():
                 log.warn('Partition %s of %s does not exist when checking held '
                         'partitions',
                         str(partition_slug), self._consumer_id)
+        return zk_partition_ids
+
+    def _check_held_partitions(self):
+        """Double-check held partitions against zookeeper
+
+        Ensure that the partitions held by this consumer are the ones that
+        zookeeper thinks it's holding. If not, rebalance.
+        """
+        log.info("Checking held partitions against ZooKeeper")
+        # build a set of partition ids zookeeper says we own
+        zk_partition_ids = self._get_held_partition_ids()
         # build a set of partition ids we think we own
         internal_partition_ids = set([p.id for p in self._partitions])
         # compare the two sets, rebalance if necessary
         if internal_partition_ids != zk_partition_ids:
             log.warning("Internal partition registry doesn't match ZooKeeper!")
-            log.debug("Internal partition ids: %s\nZooKeeper partition ids: %s",
+            log.info("Internal partition ids: %s\nZooKeeper partition ids: %s",
                     internal_partition_ids, zk_partition_ids)
-            self._rebalance()
+            # rebalance
+            self._rebalance(check_held_partitions=True)
 
     def _brokers_changed(self, brokers):
         if not self._running:
